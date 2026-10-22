@@ -23,6 +23,7 @@ const DEFAULT_CONFIG = {
   proxyKey: '',
   publicBaseUrl: '',
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
+  avoidVmc: true,          // 规划器管道改用底层公共模型 ID，绕开 VMC 私有层使钉住生效（失败自动回退）
   upstreamBase: 'https://api.cline.bot/api/v1',
   accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
   accountMode: 'single',   // single=手动指定 | roundrobin=轮询
@@ -200,11 +201,24 @@ async function orEndpoints(slug) {
 //   OpenRouter，可精确钉住。
 function slugify(s) { return String(s).toLowerCase().replace(/\s+/g, '-'); }
 
+// Cline 自 2026-10 起在订阅模型前加了一层 VMC（虚拟模型配置）：真实路由 ID 形如
+// vmc/<model>-fallbacks，第一跳固定是 Cline 自己的私有渠道 private/...-contributor
+// （provider 显示为 openai-compatible-private），失败后才回落到 OpenRouter / Vercel 公共池。
+// 私有渠道不吃 providerOptions.gateway.only，所以钉住只对"第二层"生效。
+const PRIVATE_PROVIDER = 'openai-compatible-private';
+const isPrivateSlug = (s) => typeof s === 'string' && s.startsWith('private/');
+
 function parseRouting(json) {
   const d = json?.data && json.data.choices ? json.data : json;
   const msg = d?.choices?.[0]?.message;
   const rt = msg?.provider_metadata?.gateway?.routing || d?.provider_metadata?.gateway?.routing || {};
   const direct = typeof d?.provider === 'string' ? d.provider : null;
+  const modelAttempts = Array.isArray(rt.modelAttempts) ? rt.modelAttempts : [];
+  // 实际尝试过的非私有 canonicalSlug（可用来到 OpenRouter 查同一模型的公共渠道）
+  const publicSlugs = [...new Set(
+    modelAttempts.map((a) => a?.canonicalSlug)
+      .filter((s) => typeof s === 'string' && s.includes('/') && !isPrivateSlug(s)),
+  )];
   return {
     content: msg?.content ?? null,
     usage: d?.usage || null,
@@ -214,33 +228,117 @@ function parseRouting(json) {
     finalProviderName: rt.finalProvider || direct,
     fallbacks: rt.fallbacksAvailable || [],
     plan: rt.planningReasoning || '',
+    // 命中的是 Cline 私有渠道 → 说明网关在钉住生效之前就消化了请求
+    privateLayer: rt.finalProvider === PRIVATE_PROVIDER || isPrivateSlug(rt.canonicalSlug),
+    publicSlugs,
   };
 }
 
-// 故意携带不存在的 only，让网关在路由层报错并列出可用上游（不产生 token 消耗）。
-// - 直连管道（OpenRouter）：provider.only → 404 错误 JSON 里的 metadata.available_providers
-// - 规划器管道（Vercel AI Gateway）：providerOptions.gateway.only → 400 错误文本里的 "Available providers are: ..."
-async function harvestAvailableProviders(modelId, pipeline) {
-  const acc = pickAccount();
-  const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
-  const body = pipeline === 'planner'
-    ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
-    : { ...base, provider: { only: ['__probe__'] } };
-  const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
-  const err = json?.error;
-  if (typeof err !== 'string') return null;
-  if (pipeline === 'planner') {
-    const m = /Available providers are:\s*([^.]+)/.exec(err);
-    if (!m) return null;
-    // 错误文本里可能混有 JSON 片段（如 ","type":"invalid_request_error"），必须按 slug 格式过滤
-    const toks = m[1].split(/,\s*/).map((s) => s.trim()).filter((t) => /^[a-z0-9][a-z0-9-]*$/.test(t));
-    return toks.length ? toks : null;
+// 从网关错误文本里提取被允许的渠道清单。两种格式都兼容：
+// - 规划器（Vercel）：`... Available providers are: alibaba, baseten, ... wafer","type":"invalid_request_error"`
+// - 直连（OpenRouter）：`{"error":{"metadata":{"available_providers":[...]}}}`
+function extractProviderSlugs(text) {
+  const s = String(text || '');
+  const found = new Set();
+  const line = /Available providers are:\s*([^"]*)/.exec(s);
+  if (line) {
+    for (const part of line[1].split(/,\s*/)) {
+      const v = part.trim().replace(/^["']|["'.]$/g, '');
+      if (/^[a-z0-9][a-z0-9-]*$/.test(v)) found.add(v);
+    }
   }
-  const i = err.indexOf('{');
-  if (i < 0) return null;
-  try {
-    return JSON.parse(err.slice(i))?.error?.metadata?.available_providers || null;
-  } catch { return null; }
+  const arr = /"available_providers"\s*:\s*\[([^\]]*)\]/.exec(s);
+  if (arr) {
+    for (const part of arr[1].split(',')) {
+      const v = part.trim().replace(/^"|"$/g, '');
+      if (/^[a-z0-9][a-z0-9-]*$/.test(v)) found.add(v);
+    }
+  }
+  const NOT_SLUG = new Set(['the', 'and', 'type', 'message', 'error', 'code', 'metadata']);
+  return [...found].filter((v) => !NOT_SLUG.has(v));
+}
+
+// 故意携带不存在的 only，让网关在路由层报错并列出可用上游（不产生 token 消耗）。
+// 注意：VMC 私有渠道会先接住请求（此时 only 被忽略、请求可能直接成功），
+// 只有私有渠道不可用/限流时错误才从 Vercel 或 OpenRouter 冒出来，所以必须重试。
+const PROBE_UPSTREAM = 'cp-probe-none';
+async function harvestAvailableProviders(modelId, pipeline, { tries = 5 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    const acc = pickAccount();
+    const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
+    const body = pipeline === 'planner'
+      ? { ...base, providerOptions: { gateway: { only: [PROBE_UPSTREAM] } } }
+      : { ...base, provider: { only: [PROBE_UPSTREAM] } };
+    const { json } = await fetchJSON(
+      `${config.upstreamBase}/chat/completions`,
+      { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) },
+      45000,
+    ).catch(() => ({ json: null }));
+    const err = json?.error;
+    if (err != null) {
+      const toks = extractProviderSlugs(typeof err === 'string' ? err : JSON.stringify(err));
+      if (toks.length) return toks;
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return null;
+}
+
+// ---- 兜底/主枚举：OpenRouter 与 Vercel AI Gateway 的公开 endpoints 接口 ----
+// Vercel 这个接口无需鉴权，返回的 provider 清单与网关报错里的一致（实测 18 个逐个吻合），
+// 还带 uptime/延迟/吞吐，是比"假上游探针"更稳定的枚举源。openrouter 作为第二兜底。
+const VG_API = 'https://ai-gateway.vercel.sh/v1';
+
+async function vgEndpoints(slug) {
+  if (!/^[A-Za-z0-9._/-]+$/.test(slug)) return { slug, endpoints: [] };
+  const { json } = await fetchJSON(`${VG_API}/models/${slug}/endpoints`, {}, 30000);
+  const eps = json?.data?.endpoints || [];
+  const detail = {};
+  for (const e of eps) {
+    const pSlug = slugify(e.provider_name || String(e.tag || '').split('/')[0] || '');
+    if (!pSlug) continue;
+    const d = (detail[pSlug] ||= { slug: pSlug, name: e.provider_name || pSlug, endpoints: 0, context: 0, uptime: 0, ttft: 0, tps: 0, prompt: 0, completion: 0 });
+    d.endpoints++;
+    d.context = Math.max(d.context, e.context_length || 0);
+    d.uptime = Math.max(d.uptime, Math.round(e.uptime_last_1d || e.uptime_last_1h || 0));
+    d.ttft = d.ttft || Math.round(e.latency_last_1h?.p50 || 0);
+    d.tps = Math.max(d.tps, Math.round(e.throughput_last_1h?.p50 || 0));
+    d.prompt = d.prompt || Number(e.pricing?.prompt || 0);
+    d.completion = d.completion || Number(e.pricing?.completion || 0);
+  }
+  return { slug, endpoints: Object.values(detail) };
+}
+
+async function orSlugCandidates(modelId, meta = {}) {
+  const out = new Set();
+  for (const s of meta.publicSlugs || []) if (s.includes('/')) out.add(s);
+  if (meta.canonicalSlug && String(meta.canonicalSlug).includes('/') && !isPrivateSlug(meta.canonicalSlug)) out.add(meta.canonicalSlug);
+  const tail = norm(String(modelId || '').replace(/^cline-pass\//, ''));
+  let ids = [];
+  try { ids = await orModelList(); } catch { /* 目录拉取失败不影响主流程 */ }
+  // 按模型名尾部匹配（cline-pass/deepseek-v4.1-flash → deepseek/deepseek-v4.1-flash）
+  for (const id of ids) {
+    if (norm(String(id).split('/').pop()) === tail) out.add(id);
+  }
+  return [...out];
+}
+
+// 依次尝试候选 slug：Vercel endpoints（权威）→ OpenRouter endpoints（参考）
+async function enumerateUpstreams(modelId, meta = {}) {
+  const slugs = await orSlugCandidates(modelId, meta);
+  for (const slug of slugs) {
+    try {
+      const res = await vgEndpoints(slug);
+      if (res.endpoints.length) return { source: 'vercel', slug: res.slug, upstreams: res.endpoints.map((e) => e.slug), detail: res.endpoints };
+    } catch { /* 继续下一个候选 */ }
+  }
+  for (const slug of slugs) {
+    try {
+      const res = await orEndpoints(slug);
+      if (res.endpoints.length) return { source: 'openrouter', slug: res.slug, upstreams: res.endpoints.map((e) => e.slug), detail: res.endpoints };
+    } catch { /* 继续下一个候选 */ }
+  }
+  return null;
 }
 function parseTier0(plan) {
   const m = /([\w-]+) won tier 0 over ([^."]+)/.exec(plan || '');
@@ -249,45 +347,77 @@ function parseTier0(plan) {
 }
 
 async function probeModel(modelId) {
-  const acc = pickAccount();
   const t0 = Date.now();
-  const body = { model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
-  const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
-    method: 'POST',
-    headers: chatHeaders(acc.key),
-    body: JSON.stringify(body),
-  }, 180000);
-  const ms = Date.now() - t0;
-  if (json?.error && !json?.data) {
-    return { ok: false, error: typeof json.error === 'string' ? json.error : JSON.stringify(json.error) };
+  // 裸请求只用来判断管道与"实际命中的渠道"。VMC 私有渠道限流时会返回笼统的
+  // "empty response content"，重试一次避免把偶发失败当成探测失败。
+  let json = null;
+  let lastErr = null;
+  for (let i = 0; i < 2; i++) {
+    const acc = pickAccount();
+    const body = { model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
+    const res = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
+    }, 180000).catch(() => ({ json: { error: 'network error' } }));
+    json = res.json;
+    if (!(json?.error && !json?.data)) break;
+    lastErr = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
+    await new Promise((r) => setTimeout(r, 500));
   }
+  const ms = Date.now() - t0;
+  if (json?.error && !json?.data) return { ok: false, error: lastErr || String(json.error) };
+
   const r = parseRouting(json);
+  const prev = META.models[modelId] || {};
   let harvest = null;
   if (r.pipeline) harvest = await harvestAvailableProviders(modelId, r.pipeline);
+  // 直连管道的 OpenRouter endpoint 明细（规划器管道留给兜底逻辑用）
   let endpoints = [];
   let orSlug = null;
   if (r.pipeline !== 'planner' && r.canonicalSlug) {
-    // 规划器管道的钉住发生在 Vercel 侧，OpenRouter 的 endpoint 明细仅对直连管道有参考意义
     try {
       const res = await orEndpoints(r.canonicalSlug);
       endpoints = res.endpoints;
       orSlug = res.slug;
     } catch { /* 公开接口失败不影响探测结果 */ }
   }
-  const prev = META.models[modelId] || {};
+  // 枚举公共渠道：优先用 Vercel/OpenRouter 的公开 endpoints 接口（稳定、零 token），
+  // 假上游探针只在网关恰好透传错误时作为补充。
+  let upstreamSource = harvest ? 'gateway' : null;
+  let enumRes = null;
+  if (!harvest || r.pipeline === 'planner') {
+    enumRes = await enumerateUpstreams(modelId, { ...prev, canonicalSlug: r.canonicalSlug, publicSlugs: r.publicSlugs });
+  }
+  if (enumRes) {
+    orSlug = orSlug || enumRes.slug;
+    for (const e of enumRes.detail || []) endpoints.push(e);
+    if (!harvest) {
+      harvest = enumRes.upstreams;
+      upstreamSource = enumRes.source;
+    }
+  }
   const detail = { ...prev.upstreamDetail };
   for (const e of endpoints) detail[e.slug] = e;
   const upstreams = r.pipeline === 'planner'
     ? [...new Set([...(harvest || []), ...r.fallbacks])]
     : [...new Set([...r.fallbacks, ...(harvest || []), ...Object.keys(detail)])];
   const tier0 = [...new Set([...(prev.tier0 || []), ...parseTier0(r.plan)])];
+  // 规划器管道：验证换公共模型 ID 后 only 是否真被采纳（决定请求链路是否走 publicSlug）
+  let publicRouteOk = false;
+  if (r.pipeline === 'planner' && orSlug && upstreams.length) {
+    publicRouteOk = await verifyPublicRoute(orSlug, upstreams);
+  }
   META.models[modelId] = {
     ...prev,
     ok: true,
     pipeline: r.pipeline,
     pinnable: !!r.pipeline,
+    privateLayer: !!r.privateLayer,
+    publicSlugs: r.publicSlugs?.length ? r.publicSlugs : (prev.publicSlugs || []),
     availableProviders: harvest || prev.availableProviders || [],
+    upstreamSource: upstreamSource || prev.upstreamSource || null,
     canonicalSlug: r.canonicalSlug,
+    publicSlug: orSlug || prev.publicSlug || null,
+    publicRouteOk,
     openrouterSlug: orSlug,
     upstreamDetail: detail,
     upstreams,
@@ -303,7 +433,7 @@ async function probeModel(modelId) {
 // 上游渠道可用性分类：渠道被单独钉住时的真实状态
 function classifyUpstreamError(msg) {
   const m = String(msg || '');
-  if (/empty response content/i.test(m)) return 'ok';                     // 请求已到达模型（推理耗尽 max_tokens 导致内容为空）
+  if (/empty response content/i.test(m)) return 'unknown';                // 网关吞掉了真实原因（VMC 私有层失败时的通用错误），无法判定渠道状态
   if (/429|rate-?limited|temporarily rate/i.test(m)) return 'limited';   // 渠道有效，共享池限流中
   if (/invalid_request|modelid|no allowed providers|no available providers|not found|unsupported/i.test(m)) return 'bad'; // 不可钉住
   if (/unauthorized|re-authenticate|401/i.test(m)) return 'auth';        // 账号 key 问题，与渠道无关
@@ -321,9 +451,7 @@ function learnUpstreamStatus(modelId, upstream, errMsg) {
 // 自动+排除模式：only 白名单与网关侧渠道清单不一致时，网关报错会附最新清单，合并学习
 // （触发场景：探测缓存过期，网关侧新增了渠道而本地 known 列表没有——白名单漏掉新渠道）
 function learnAvailableProviders(modelId, errMsg) {
-  const m = /Available providers are:\s*([^.]+)/.exec(String(errMsg || ''));
-  if (!m) return;
-  const toks = m[1].split(/,\s*/).map((s) => s.trim()).filter((t) => /^[a-z0-9][a-z0-9-]*$/.test(t));
+  const toks = extractProviderSlugs(errMsg);
   if (!toks.length) return;
   const meta = (META.models[modelId] ||= {});
   const before = (meta.upstreams || []).length;
@@ -473,8 +601,10 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
   const allowList = exclude.length ? known.filter((u) => !exclude.includes(u)) : null;
   if (!upstream && !sort && !(allowList && allowList.length)) return b;
   const pipeline = meta.pipeline || null;
-  const useVercel = pipeline === 'planner' || pipeline === null;
-  const useOpenRouter = pipeline === 'direct' || pipeline === null;
+  // 管道未知时只发 Vercel 形式：实测同时带顶层 provider 与 providerOptions.gateway 会让网关直接 500。
+  // 订阅模型绝大多数走规划器（Vercel），直连模型探测一次后就会走对分支。
+  const useVercel = pipeline !== 'direct';
+  const useOpenRouter = pipeline === 'direct';
   if (useVercel) {
     const gw = {};
     if (upstream) {
@@ -524,13 +654,47 @@ function buildAttempts(modelId, cfg) {
   return [{ ...base, upstream: null, orderRest: [], excludeList: exclude }];
 }
 
+// 验证"换公共模型 ID 后 only 是否真的生效"：部分模型（如 deepseek-v4.1-flash）虽然是公共 ID，
+// 但 Cline 仍按自己的规划器在所有渠道间加权，only 被静默忽略。只有 finalProvider 命中才算数。
+async function verifyPublicRoute(publicSlug, upstreams) {
+  const list = [...new Set(upstreams || [])];
+  if (list.length < 2) return false;
+  // 取首尾两个渠道各验一次：只验一个可能会撞上"默认就选中它"的假阳性
+  // （deepseek-v4.1-flash 默认路由就是清单首位 alibaba，单点验证会误判）。
+  for (const target of [list[0], list[list.length - 1]]) {
+    const acc = pickAccount();
+    const body = { model: publicSlug, messages: [{ role: 'user', content: 'Reply with OK' }], max_tokens: 128, providerOptions: { gateway: { only: [target] } } };
+    const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
+    }, 120000).catch(() => ({ json: null }));
+    if (json?.error && !json?.data) return false;
+    if (parseRouting(json).finalProvider !== target) return false;
+  }
+  return true;
+}
+
 // 把上游错误信息归一成短字符串（用于学习与尝试日志）
 const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.stringify(e));
 
+// 规划器管道的钉住被 VMC 私有层挡在 only 之前（私有层不吃 gateway.only）。
+// 实测：把 model 换成底层公共模型 ID 直接发（如 cline-pass/deepseek-v4.1-flash-1017 →
+// deepseek/deepseek-v4.1-flash-1017），私有层不再参与，only 立刻生效且走同样的系统凭证。
+// 并非每个模型都有可用公共 ID，所以失败会自动回退原 cline-pass/* 请求。
+// 可用 config.avoidVmc=false 关闭该行为。
+function modelVariants(modelId) {
+  const meta = META.models[modelId] || {};
+  const out = [];
+  if (config.avoidVmc !== false && meta.pipeline === 'planner' && meta.publicRouteOk && meta.publicSlug && meta.publicSlug !== modelId) {
+    out.push({ model: meta.publicSlug, viaPublic: true });
+  }
+  out.push({ model: modelId, viaPublic: false });
+  return out;
+}
+
 // 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
 // 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
-async function attemptOnce(modelId, body, attempt, signal) {
-  const send = injectPrefs(body, modelId, attempt);
+async function attemptOnce(sendModel, prefsModelId, body, attempt, signal) {
+  const send = { ...injectPrefs(body, prefsModelId, attempt), model: sendModel };
   const acc = pickAccount();
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
@@ -551,6 +715,9 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
 async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
   const attempts = buildAttempts(modelId, cfg);
+  // 每个上游候选再展开成「公共模型 ID 优先 / 原 model 兜底」两次尝试
+  const variants = modelVariants(modelId);
+  const jobs = attempts.flatMap((a) => variants.map((v) => ({ ...a, sendModel: v.model, viaPublic: v.viaPublic })));
   const trace = [];
   const t0 = Date.now();
   let last = null;
@@ -559,14 +726,14 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   const onClientClose = () => { if (activeCtrl) activeCtrl.abort(); };
   req.on('close', onClientClose);
   try {
-    for (const attempt of attempts) {
+    for (const attempt of jobs) {
       const t1 = Date.now();
       const ctrl = new AbortController();
       activeCtrl = ctrl;
       const timer = setTimeout(() => ctrl.abort(), attemptTimeoutMs);
       try {
         if (stream) {
-          const send = injectPrefs(body, modelId, attempt);
+          const send = { ...injectPrefs(body, modelId, attempt), model: attempt.sendModel };
           const acc = pickAccount();
           let up = null;
           let netError = null;
@@ -617,27 +784,27 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             }
             try { json = JSON.parse(text); } catch {}
             const msg = errText(json?.error) || text.slice(0, 160) || netError;
-            trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
+            trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
             last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
           }
           if (!up) {
-            trace.push({ upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
+            trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
             last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response' };
             continue;
           }
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
-          trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream' });
+          trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: 200, ms, note: 'stream' });
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(attempt.sendModel, modelId, body, attempt, ctrl.signal);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
-        trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
+        trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: r.status, ms, note });
         if (r.status !== 200 && attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, errText(r.out?.error?.message));
         if (r.status !== 200 && !attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, r.netError || note);
         last = r;
@@ -812,6 +979,7 @@ const server = http.createServer(async (req, res) => {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
         actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline, pinnable: r.pipeline !== null,
+        privateLayer: !!r.privateLayer, publicSlugs: r.publicSlugs,
         canonicalSlug: r.canonicalSlug, fallbacks: r.fallbacks, content: (r.content || '').slice(0, 120),
         account: chain.acc?.name || null, trace,
       });

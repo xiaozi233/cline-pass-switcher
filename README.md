@@ -8,6 +8,7 @@
 
 - 🔍 **上游枚举与校验** —— 列出订阅模型背后每一条上游渠道，并一键实测哪些「✔可用 / ⏳限流 / ✘不可钉」
 - 🎯 **精确钉住上游** —— 严格钉住 / 优先+回退两种模式，支持按最低成本、最快首字、最高吞吐排序
+- 🩹 **绕开 VMC 私有层（2026-10 新增）** —— Cline 现在给订阅模型加了一层私有渠道前置（`openai-compatible-private`），不吃 `only`；探测确认后自动改用底层公共模型 ID 请求，钉住恢复精确生效，验证不过的模型自动回退
 - 🧬 **多上游优先级故障转移（2026-09-06 新增）** —— 勾选多个上游即按勾选顺序逐个尝试：第一个异常（报错 / 网络失败 / 超时）自动顺切下一个，全部失败才透传错误；每次尝试有独立 120s 超时与逐次尝试明细（请求头 X-Cline-Target-Upstream: a>b 与 X-Cline-Attempts，历史与测试台展示逐次尝试路径 upstream(502) 到 upstream(200)）
 - 🚫 **上游排除** —— 勾「排除」的渠道永不被使用：勾选模式下从候选中剔除；自动模式与优先+回退模式下把排除换算成 only 白名单（已知上游 - 排除项）注入，两类管道均实测生效；网关侧渠道清单更新导致白名单过期时，报错中附带的最新渠道清单会被自动学习合并
 - 👥 **账号池** —— 多账号管理、手动切换、轮询均衡、逐账号连通性测试与用量统计
@@ -98,6 +99,7 @@ location / {
 | `proxyKey` | 下游代理密钥；空 = 不鉴权 |
 | `publicBaseUrl` | 公网代理地址（控制台展示用） |
 | `exposeCatalog` | `true` 时代理的 `/v1/models` 会合并 Cline 公开目录模型；默认 `false` 只返回订阅模型（避免客户端模型列表被淹没） |
+| `avoidVmc` | 规划器管道改用底层公共模型 ID 请求，绕开 VMC 私有层让钉住精确生效；默认 `true`，探测未通过的模型自动回退原 `cline-pass/*` |
 | `knownModels` | 订阅模型清单（控制台主表） |
 | `perModel` | 每模型的钉住配置：`{ upstream, pinMode: strict|preferred, sort: cost|ttft|tps, maxRetries }` |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
@@ -129,9 +131,31 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 
 ### 上游枚举的三种手段
 
-1. **响应元数据回读**：规划器管道带 `canonicalSlug` / `fallbacksAvailable` / `finalProvider`；直连管道顶层 `provider` 即实际上游；
-2. **假上游探测**（零 token）：带不存在的 `only:["__probe__"]` 让网关在路由层报错并列出精确的可用渠道清单（两条管道的清单**不一致**，要分别取）；
-3. **OpenRouter 公开接口** `GET /api/v1/models/{slug}/endpoints`：补充上下文长度/在线率（对直连管道有直接参考意义）。
+1. **响应元数据回读**：规划器管道带 `canonicalSlug` / `fallbacksAvailable` / `finalProvider`，并新增 `modelAttempts`（逐次尝试的 canonicalSlug 与 provider）；直连管道顶层 `provider` 即实际上游；
+2. **网关公开 endpoints 接口（当前主用）**：`GET https://ai-gateway.vercel.sh/v1/models/{slug}/endpoints` 无需鉴权，
+   返回的 provider 清单与网关报错里的一致，还带可用率 / 延迟 / 吞吐；OpenRouter 的 `/{slug}/endpoints` 作第二兜底；
+3. **假上游探测**（零 token，已降级为补充）：带不存在的 `only` 让网关报出渠道清单。两条管道写法不同（顶层 `provider` vs `providerOptions.gateway`）。
+
+### 2026-10 网关变化：VMC 私有层与「钉住直通」
+
+Cline 给订阅模型套了一层 **VMC（虚拟模型配置）**：真实路由 ID 变成 `vmc/<model>-fallbacks`，**第一跳固定是 Cline 自己的私有渠道**
+`private/...-contributor`（响应里显示为 `openai-compatible-private`），失败后才回落到 Vercel 公共池。
+这一层**不吃 `providerOptions.gateway.only`**，所以：
+
+- 私有渠道健康时，请求被它直接接住 → 表现为「钉住不生效」，`lastProvider` 恒为 `openai-compatible-private`；
+- 私有渠道失败时，错误才从 Vercel 冒出来，假上游探针也才偶尔能拿到清单（其余时候被统一吞成 `empty response content`）。
+
+**解决办法（控制台已内置）**：把请求的 `model` 换成底层公共模型 ID 直接发给网关，
+私有层就不再参与，`only` 立即精确生效（实测 `cline-pass/deepseek-v4.1-flash-1017` → `deepseek/deepseek-v4.1-flash-1017`，钉 baseten/deepseek/wafer 全部命中）：
+
+```json
+{ "model": "deepseek/deepseek-v4.1-flash-1017", "providerOptions": { "gateway": { "only": ["wafer"] } } }
+```
+
+探测时会用首尾两个渠道各验一次，只有两次都命中才标记 **钉住直通**（绿色徽章）；验证不过的模型（如 `deepseek-v4.1-flash`）
+自动回退到原 `cline-pass/*` 请求，不会因为这条路径挂掉。可用 `avoidVmc: false` 关闭该行为。
+
+> 直连管道的模型（如 `glm-5.3-flash`）本来就吃顶层 `provider.only`，无需直通。
 
 ### 实测记录（2026-09）
 
@@ -143,6 +167,17 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 | glm-5.2 + `providerOptions.gateway.sort:"cost"` | ✔ 按成本重排执行顺序 |
 | glm-5.3-flash（直连）+ 顶层 `provider.only:["gmicloud"]` | ✔ `provider: "GMICloud"` |
 | glm-5.3-flash + `providerOptions.gateway` | ✘ 无效（直连管道只认顶层 provider 形式） |
+
+### 实测记录（2026-10，VMC 上线后）
+
+| 实验 | 结果 |
+|---|---|
+| `cline-pass/deepseek-v4.1-flash-1017` + `gateway.only:["baseten"]` | ✘ 被 `openai-compatible-private` 接住，only 未评估 |
+| `deepseek/deepseek-v4.1-flash-1017` + `gateway.only:["baseten"]` | ✔ `finalProvider: baseten`，`Provider set restricted to: baseten` |
+| 同上，流式 | ✔ 首个 chunk 即钉住渠道，`provider in stream: baseten` |
+| `deepseek/deepseek-v4.1-flash` + `gateway.only:["baseten"]` | ✘ 落到 alibaba，规划器忽略 only → 该模型无直通 |
+| 假上游 `only:["__probe__"]` | ✘ 私有层吞掉请求，返回 200 或 `empty response content` |
+| `GET ai-gateway.vercel.sh/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints` | ✔ 18 个 provider，与报错清单完全一致 |
 
 > 管道归属由 Cline 侧决定、可能随时间变化，控制台的「探测」会刷新每个模型的管道类型与渠道清单。
 

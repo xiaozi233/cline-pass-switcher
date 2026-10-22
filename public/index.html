@@ -320,10 +320,14 @@ function render() {
     const canon = m?.canonicalSlug ? `<span class="mono dim">${m.canonicalSlug}</span>` : '<span class="dim">—</span>';
     const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">tier-0: ${m.tier0.join(', ')}</div>` : '';
     const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
+    const priv = m?.publicRouteOk
+      ? `<span class="badge green" title="探测已确认：请求改走底层公共模型 ID，钉住精确生效（绕过 VMC 私有层）">钉住直通</span>`
+      : m?.privateLayer ? `<span class="badge orange" title="Cline 先走自己的私有渠道（openai-compatible-private），该层不吃 only；此模型暂无法绕过，钉住只在私有层失败后生效">私有渠道前置</span>` : '';
+    const src = m?.upstreamSource && m.upstreamSource !== 'gateway' ? `<div class="dim" style="font-size:11px">清单来源：${m.upstreamSource === 'vercel' ? 'Vercel 官方' : 'OpenRouter（参考）'}</div>` : '';
     const mode = s.config.pinMode || 'strict';
     const sort = s.config.sort || '';
     return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
-      <td class="mono">${s.id}<div style="margin-top:4px">${pipe}</div>${tier0}</td>
+      <td class="mono">${s.id}<div style="margin-top:4px">${pipe}${priv}</div>${tier0}${src}</td>
       <td>${canon}</td>
       <td>${ups === null ? '<span class="dim">—</span>' : ups}</td>
       <td>${last}${m?.lastMs ? `<div class="dim" style="font-size:11px">${m.lastMs} ms</div>` : ''}</td>
@@ -428,7 +432,9 @@ async function probe(id, btn) {
   btn.disabled = true; btn.textContent = '探测中…'; status('正在探测 ' + id);
   const r = await api('/api/probe', { model: id });
   btn.disabled = false; btn.textContent = '探测';
-  status(r.ok ? `${id} 探测完成：上游 ${r.upstreams?.length ?? 0} 个，命中 ${r.lastProvider}` : `探测失败：${r.error}`);
+  status(r.ok
+    ? `${id} 探测完成：上游 ${r.upstreams?.length ?? 0} 个（${r.upstreamSource === 'vercel' ? 'Vercel 官方清单' : r.upstreamSource === 'openrouter' ? 'OpenRouter 参考清单' : r.upstreamSource === 'gateway' ? '网关实测' : '未知来源'}），命中 ${r.lastProvider}${r.privateLayer ? '（网关私有渠道前置）' : ''}${r.publicRouteOk ? '，钉住直通已启用' : ''}`
+    : `探测失败：${r.error}`);
   await loadAll();
 }
 
@@ -521,13 +527,14 @@ function showTest(r, model, target) {
   }
   const hit = !targets.length || r.actual === targets[0];
   const hitExcluded = Array.isArray(r.exclude) && r.exclude.length && r.exclude.includes(r.actual);
+  const viaPrivate = !!r.privateLayer;
   el.innerHTML = `<div class="kvs">
       <div>模型 <b class="mono">${model}</b></div>
       <div>目标上游 <b>${targets.length ? targets.join(' → ') : '自动'}</b></div>
-      <div>实际上游 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
+      <div>实际上游 <b class="${viaPrivate ? 'mismatch' : hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
       <div>耗时 <b>${r.ms} ms</b></div>
     </div>${traceHtml(r.trace)}
-    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
+    ${viaPrivate ? `<div class="mismatch">⚠ 本次由 Cline 私有渠道 openai-compatible-private 直接应答，该层不受 only 约束，钉住未被评估（未生效≠失效）。等私有渠道失败/限流时才会切到你钉的公共渠道。</div>` : hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
     <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${r.canonicalSlug || '—'}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
 }
 
