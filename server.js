@@ -23,7 +23,9 @@ const DEFAULT_CONFIG = {
   proxyKey: '',
   publicBaseUrl: '',
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
-  avoidVmc: true,          // 规划器管道改用底层公共模型 ID，绕开 VMC 私有层使钉住生效（失败自动回退）
+  avoidVmc: false,         // 是否允许把 planner 请求换成底层公共模型 ID 绕开 VMC 私有层。
+                           // 默认关闭：公共 ID 走 Cline Credits 按量计费，不属于订阅额度，余额不足会 402
+  enforcePin: false,       // 严格钉住的"命中校验"：开启后非流式请求若实际命中 ≠ 目标上游，直接报 409 而不是静默返回
   upstreamBase: 'https://api.cline.bot/api/v1',
   accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
   accountMode: 'single',   // single=手动指定 | roundrobin=轮询
@@ -402,9 +404,15 @@ async function probeModel(modelId) {
     : [...new Set([...r.fallbacks, ...(harvest || []), ...Object.keys(detail)])];
   const tier0 = [...new Set([...(prev.tier0 || []), ...parseTier0(r.plan)])];
   // 规划器管道：验证换公共模型 ID 后 only 是否真被采纳（决定请求链路是否走 publicSlug）
+  // avoidVmc=false 时完全不碰公共模型 ID（公共 ID 走 Credits 按量计费，不属于订阅额度）
   let publicRouteOk = false;
-  if (r.pipeline === 'planner' && orSlug && upstreams.length) {
-    publicRouteOk = await verifyPublicRoute(orSlug, upstreams);
+  if (config.avoidVmc !== false && r.pipeline === 'planner' && orSlug && upstreams.length) {
+    publicRouteOk = await verifyPublicRoute(modelId, orSlug, upstreams);
+  }
+  // 订阅内的钉住方案：能力过滤 has 踢掉私有层（不碰公共模型 ID、不消耗 Credits）
+  let hasPin = null;
+  if (r.pipeline === 'planner' && upstreams.length >= 2) {
+    hasPin = await probeHasPin(modelId, upstreams, r.pipeline);
   }
   META.models[modelId] = {
     ...prev,
@@ -418,6 +426,10 @@ async function probeModel(modelId) {
     canonicalSlug: r.canonicalSlug,
     publicSlug: orSlug || prev.publicSlug || null,
     publicRouteOk,
+    // 订阅内钉住：has 能力过滤是否可用（planner 管道、不涉及公共 ID）
+    hasPinOk: !!hasPin,
+    gatewayHas: hasPin?.caps || prev.gatewayHas || null,
+    hasPinVerifiedWith: hasPin?.verifiedWith || null,
     openrouterSlug: orSlug,
     upstreamDetail: detail,
     upstreams,
@@ -426,8 +438,24 @@ async function probeModel(modelId) {
     lastMs: ms,
     probedAt: Date.now(),
   };
+  // 验证通过说明余额/路由都正常，清掉之前的直通封锁标记
+  if (publicRouteOk) delete META.models[modelId].publicRouteBlocked;
   saveMeta();
   return { ok: true, ms, ...META.models[modelId] };
+}
+
+// 钉住直通走的是 Cline Credits 公共计费（不是订阅额度）。余额耗尽时网关直接 402，
+// 表现为"直通尝试失败 → 回退原 model → 命中私有渠道"，也就是用户看到的"路由偏离"。
+// 一旦确认余额不足就短路：把 publicRouteOk 关掉，后续请求不再白打一次 402（充值后重新探测即可恢复）。
+function noteCreditsExhausted(modelId, msg) {
+  if (!/insufficient_credits|Insufficient balance/i.test(String(msg || ''))) return false;
+  const meta = (META.models[modelId] ||= {});
+  if (meta.publicRouteOk !== false || !meta.publicRouteBlocked) {
+    meta.publicRouteOk = false;
+    meta.publicRouteBlocked = { reason: 'insufficient_credits', note: String(msg).slice(0, 200), at: Date.now() };
+    saveMeta();
+  }
+  return true;
 }
 
 // 上游渠道可用性分类：渠道被单独钉住时的真实状态
@@ -593,7 +621,7 @@ const OR_SORT = { cost: 'price', ttft: 'latency', tps: 'throughput' };
 // excludeList: 排除列表。网关不支持 exclude/ignore 字段（实测被静默忽略），因此排除统一换算成 only 白名单：
 // 自动模式 only=已知上游-排除；preferred 钉住模式 order=[当前,...] 且 only=已知上游-排除（防止网关回退到被排除渠道）；
 // 严格钉住模式 only=[当前上游]，天然排除其他一切渠道。
-function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null }) {
+function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null, gatewayHas = null }) {
   const b = JSON.parse(JSON.stringify(body));
   const exclude = (excludeList || []).filter((u) => u !== upstream);
   const meta = META.models[modelId] || {};
@@ -617,6 +645,9 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
       gw.only = allowList;
     }
     if (sort) gw.sort = sort;
+    // 能力过滤 has：VMC 私有渠道不满足该能力时会被排除，only 才有机会被评估（实测 2026-10）
+    // 只在明确钉了某个上游时注入——自动模式下加 has 会把私有层整个排除掉，属于额外的行为改变
+    if (gatewayHas && gatewayHas.length && upstream) gw.has = gatewayHas;
     b.providerOptions = { ...(b.providerOptions || {}), gateway: { ...(b.providerOptions?.gateway || {}), ...gw } };
   }
   if (useOpenRouter) {
@@ -656,7 +687,7 @@ function buildAttempts(modelId, cfg) {
 
 // 验证"换公共模型 ID 后 only 是否真的生效"：部分模型（如 deepseek-v4.1-flash）虽然是公共 ID，
 // 但 Cline 仍按自己的规划器在所有渠道间加权，only 被静默忽略。只有 finalProvider 命中才算数。
-async function verifyPublicRoute(publicSlug, upstreams) {
+async function verifyPublicRoute(modelId, publicSlug, upstreams) {
   const list = [...new Set(upstreams || [])];
   if (list.length < 2) return false;
   // 取首尾两个渠道各验一次：只验一个可能会撞上"默认就选中它"的假阳性
@@ -667,10 +698,40 @@ async function verifyPublicRoute(publicSlug, upstreams) {
     const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
       method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
     }, 120000).catch(() => ({ json: null }));
-    if (json?.error && !json?.data) return false;
+    if (json?.error && !json?.data) {
+      noteCreditsExhausted(modelId, errText(json.error));
+      return false;
+    }
     if (parseRouting(json).finalProvider !== target) return false;
   }
   return true;
+}
+
+// 探测「能力过滤能否踢掉 VMC 私有层」：planner 管道上，has 命中私有渠道不满足的能力时，
+// 私有层会被排除，providerOptions.gateway.only 才真正生效（实测 2026-10）。
+// 逐个能力试，找到第一个能让 finalProvider 命中目标渠道的即可（全部走订阅额度，不消耗 Credits）。
+const HAS_CAPS = ['vision', 'tool-use', 'implicit-caching', 'structured-output', 'reasoning'];
+async function probeHasPin(modelId, upstreams, pipeline) {
+  if (pipeline !== 'planner') return null;
+  const list = [...new Set(upstreams || [])];
+  if (list.length < 2) return null;
+  // 用清单末尾的渠道做验证：首位常常是网关的默认选择，容易假阳性
+  const target = list[list.length - 1];
+  for (const cap of HAS_CAPS) {
+    const acc = pickAccount();
+    const body = {
+      model: modelId,
+      messages: [{ role: 'user', content: 'Reply with OK' }],
+      max_tokens: 64,
+      providerOptions: { gateway: { only: [target], has: [cap] } },
+    };
+    const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
+    }, 120000).catch(() => ({ json: null }));
+    if (json?.error && !json?.data) continue;
+    if (parseRouting(json).finalProvider === target) return { caps: [cap], verifiedWith: target };
+  }
+  return null;
 }
 
 // 把上游错误信息归一成短字符串（用于学习与尝试日志）
@@ -678,7 +739,9 @@ const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.string
 
 // 规划器管道的钉住被 VMC 私有层挡在 only 之前（私有层不吃 gateway.only）。
 // 实测：把 model 换成底层公共模型 ID 直接发（如 cline-pass/deepseek-v4.1-flash-1017 →
-// deepseek/deepseek-v4.1-flash-1017），私有层不再参与，only 立刻生效且走同样的系统凭证。
+// deepseek/deepseek-v4.1-flash-1017），私有层不再参与，only 立刻生效。
+// ⚠ 计费边界：只有 cline-pass/* 前缀吃订阅额度；换成公共 ID 就走 Cline Credits 按量计费，
+// Credits 余额不足会直接 402（insufficient_credits），与订阅额度是否充足无关。
 // 并非每个模型都有可用公共 ID，所以失败会自动回退原 cline-pass/* 请求。
 // 可用 config.avoidVmc=false 关闭该行为。
 function modelVariants(modelId) {
@@ -715,9 +778,14 @@ async function attemptOnce(sendModel, prefsModelId, body, attempt, signal) {
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
 async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
   const attempts = buildAttempts(modelId, cfg);
+  const metaM = META.models[modelId] || {};
   // 每个上游候选再展开成「公共模型 ID 优先 / 原 model 兜底」两次尝试
   const variants = modelVariants(modelId);
-  const jobs = attempts.flatMap((a) => variants.map((v) => ({ ...a, sendModel: v.model, viaPublic: v.viaPublic })));
+  // planner 管道上，带 has 的版本排在前面：它能踢掉 VMC 私有层让 only 生效；失败自动退到无 has 版本
+  const hasOpts = (metaM.pipeline === 'planner' && metaM.hasPinOk && Array.isArray(metaM.gatewayHas) && metaM.gatewayHas.length)
+    ? [{ gatewayHas: metaM.gatewayHas, viaHas: true }, { gatewayHas: null, viaHas: false }]
+    : [{ gatewayHas: null, viaHas: false }];
+  const jobs = attempts.flatMap((a) => variants.flatMap((v) => hasOpts.map((h) => ({ ...a, sendModel: v.model, viaPublic: v.viaPublic, ...h }))));
   const trace = [];
   const t0 = Date.now();
   let last = null;
@@ -784,28 +852,30 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             }
             try { json = JSON.parse(text); } catch {}
             const msg = errText(json?.error) || text.slice(0, 160) || netError;
-            trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
+            trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, viaHas: attempt.viaHas, upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
+            if (attempt.viaPublic) noteCreditsExhausted(modelId, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
             last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
           }
           if (!up) {
-            trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
+            trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, viaHas: attempt.viaHas, upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
             last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response' };
             continue;
           }
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
-          trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: 200, ms, note: 'stream' });
+          trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, viaHas: attempt.viaHas, upstream: attempt.upstream, status: 200, ms, note: 'stream' });
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
         const r = await attemptOnce(attempt.sendModel, modelId, body, attempt, ctrl.signal);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
-        trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, upstream: attempt.upstream, status: r.status, ms, note });
+        trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, viaHas: attempt.viaHas, upstream: attempt.upstream, status: r.status, ms, note });
         if (r.status !== 200 && attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, errText(r.out?.error?.message));
+        if (r.status !== 200 && attempt.viaPublic) noteCreditsExhausted(modelId, errText(r.out?.error?.message) || note);
         if (r.status !== 200 && !attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, r.netError || note);
         last = r;
         if (r.status === 200) break;
@@ -871,7 +941,7 @@ async function handleChat(req, res) {
           provider = fp ? fp[1] : null;
           canonical = cs ? cs[1] : null;
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
+        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace });
         cb();
       },
     });
@@ -881,6 +951,26 @@ async function handleChat(req, res) {
 
   const { status, out, routing, acc } = chain;
   if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
+  // 严格钉住的命中校验（enforcePin）：宁可直接报错，也不让调用方拿到"其实换了上游"的结果。
+  // 只对非流式生效——流式的 provider 元数据在末尾 chunk，写响应头时还无法判定。
+  if (config.enforcePin === true && status === 200) {
+    const target = ((cfg.upstreams || []).find((u) => u) || null);
+    const strict = (cfg.pinMode || 'strict') === 'strict';
+    if (strict && target && routing.finalProvider !== target) {
+      record(modelId, {
+        provider: routing.finalProvider || null, canonical: routing.canonicalSlug || null,
+        ms: Date.now() - chain.t0, stream: false, attempts: chain.trace.map((t) => t.upstream || 'auto'),
+        trace: chain.trace, error: `pin_mismatch: ${routing.finalProvider}`, account: acc ? acc.name : null,
+      });
+      return sendJSON(res, 409, {
+        error: {
+          message: `pin_mismatch: 目标上游 ${target}，实际 ${routing.finalProvider || '未知'}。enforcePin 已开启，拒绝返回非目标上游的结果。`,
+          type: 'pin_mismatch',
+        },
+        target, actual: routing.finalProvider || null, trace: chain.trace,
+      });
+    }
+  }
   // 客户端实际使用成功的新订阅模型自动收录进列表
   if (status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
     config.knownModels.push(modelId);
