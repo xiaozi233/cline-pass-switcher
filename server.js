@@ -9,28 +9,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
-import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
-
-// api.cline.bot 的 TLS 1.3 握手偶尔会被对端直接断开（2026-10-27 实测过一次：连续 ECONNRESET，
-// 约 10 秒后断，而同一时刻 TLS 1.2 正常、curl 走 schannel 也正常；几小时后 1.3 自行恢复）。
-// 因此不写死版本：默认用系统默认（TLS 1.3），一旦遇到 ECONNRESET 就自动降级到 TLS 1.2 并重试，
-// 之后保持 1.2 直到重启，避免每条请求都白等 10 秒。要固定版本用 TLS_MAX_VERSION 环境变量。
-if (process.env.TLS_MAX_VERSION) tls.DEFAULT_MAX_VERSION = process.env.TLS_MAX_VERSION;
-let tlsDegraded = false;
-async function fetchTls(url, opts) {
-  try {
-    return await fetch(url, opts);
-  } catch (e) {
-    const code = e?.cause?.code || e?.code || '';
-    const reset = code === 'ECONNRESET' || /ECONNRESET|socket disconnected before secure TLS/i.test(e?.message || '');
-    if (tlsDegraded || !reset) throw e;
-    tlsDegraded = true;
-    tls.DEFAULT_MAX_VERSION = 'TLSv1.2';
-    console.warn('[网络] TLS 连接被重置（疑似 TLS 1.3 握手被对端断开），已自动降级到 TLS 1.2 并重试');
-    return await fetch(url, opts);
-  }
-}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || __dirname;
@@ -174,7 +153,7 @@ async function fetchJSON(url, opts = {}, timeoutMs = 60000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetchTls(url, { ...opts, signal: ctrl.signal });
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch { json = { raw: text }; }
@@ -573,7 +552,7 @@ async function fetchOfficialModels() {
   } catch { /* 来源不可用则跳过 */ }
   // 官方文档表格兜底
   try {
-    const res = await fetchTls('https://docs.cline.bot/getting-started/clinepass', { signal: AbortSignal.timeout(30000) });
+    const res = await fetch('https://docs.cline.bot/getting-started/clinepass', { signal: AbortSignal.timeout(30000) });
     const text = await res.text();
     const ids = text.match(/cline-pass\/[a-z0-9._-]+/gi) || [];
     if (ids.length) { ids.forEach((id) => found.add(id.toLowerCase())); sources.push('docs.cline.bot'); }
@@ -781,7 +760,7 @@ async function attemptOnce(sendModel, prefsModelId, body, attempt, signal) {
   const send = { ...injectPrefs(body, prefsModelId, attempt), model: sendModel };
   const acc = pickAccount();
   try {
-    const res = await fetchTls(`${config.upstreamBase}/chat/completions`, {
+    const res = await fetch(`${config.upstreamBase}/chat/completions`, {
       method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
     });
     const json = await res.json().catch(() => null);
@@ -827,7 +806,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           let up = null;
           let netError = null;
           try {
-            up = await fetchTls(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
+            up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
           } catch (e) { netError = e.message; }
           const ctype = up?.headers?.get('content-type') || '';
           let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');

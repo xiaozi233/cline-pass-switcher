@@ -281,13 +281,6 @@ Cline 给订阅模型套了一层 **VMC（虚拟模型配置）**：真实路由
 **Q：订阅额度怎么计？**
 经代理的请求与直连官方 API 计费一致；「探测/测试/校验」会产生极小额的真实请求（每次约 0.0002 美元级）。
 
-**Q：突然全部请求报 `upstream fetch failed`，但 curl 访问 `api.cline.bot` 是通的？**
-先怀疑 TLS 层，而不是 DNS 或代理。`api.cline.bot` 的 TLS 1.3 握手偶发会被对端断开，
-Node（OpenSSL）表现为约 10 秒后 `ECONNRESET: Client network socket disconnected before secure TLS connection was established`；
-而 `curl` 在 Windows 上走系统 schannel，能正常通过 —— 于是出现「curl 通、服务不通」的假象。
-代理已内置自适应：默认跟随系统 TLS 版本，遇到该错误会自动降级到 TLS 1.2 并重试一次（日志会打印一行提示）。
-要固定版本用环境变量 `TLS_MAX_VERSION=TLSv1.2` 或 `TLSv1.3`。
-
 ---
 
 ## 安全提醒
