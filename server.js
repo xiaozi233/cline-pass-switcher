@@ -9,7 +9,14 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
+import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
+
+// api.cline.bot 的 TLS 1.3 握手会被对端直接断开（2026-10 实测：TLS1.3 → 10s 后 ECONNRESET，
+// TLS1.2 → 200/250ms；curl 走 schannel 能过，Node 走 OpenSSL 过不去）。
+// undici 的 fetch 没有 per-request 的 TLS 选项，只能设全局默认上限；
+// 需要时用环境变量覆盖：TLS_MAX_VERSION=TLSv1.3。
+tls.DEFAULT_MAX_VERSION = process.env.TLS_MAX_VERSION || 'TLSv1.2';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || __dirname;
