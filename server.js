@@ -8,7 +8,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { Readable, Transform } from 'node:stream';
+import { Readable, Transform, pipeline } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -776,7 +776,7 @@ async function attemptOnce(sendModel, prefsModelId, body, attempt, signal) {
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
-async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
+async function runChatChain(req, res, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
   const attempts = buildAttempts(modelId, cfg);
   const metaM = META.models[modelId] || {};
   // 每个上游候选再展开成「公共模型 ID 优先 / 原 model 兜底」两次尝试
@@ -791,8 +791,25 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   let last = null;
   let activeCtrl = null;            // 当前尝试的 AbortController；流式成功后保持指向该次 fetch，用于断连时中止上游 body
   let keepCloseHook = false;        // 流式 SSE 建立后，close 钩子要保留到流结束
-  const onClientClose = () => { if (activeCtrl) activeCtrl.abort(); };
-  req.on('close', onClientClose);
+  let clientDisconnected = !!req.aborted || res.destroyed;
+  const onClientClose = () => {
+    // IncomingMessage 的 close 表示请求读取结束，并不表示客户端已关闭响应。
+    // 用 ServerResponse 的 close 判断客户端是否提前断开，避免正常上传完成时误杀上游流。
+    if (!res.writableEnded) {
+      clientDisconnected = true;
+      activeCtrl?.abort();
+    }
+  };
+  const onRequestAborted = () => {
+    clientDisconnected = true;
+    activeCtrl?.abort();
+  };
+  const cleanupCloseHooks = () => {
+    res.off('close', onClientClose);
+    req.off('aborted', onRequestAborted);
+  };
+  res.on('close', onClientClose);
+  req.on('aborted', onRequestAborted);
   try {
     for (const attempt of jobs) {
       const t1 = Date.now();
@@ -800,6 +817,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       activeCtrl = ctrl;
       const timer = setTimeout(() => ctrl.abort(), attemptTimeoutMs);
       try {
+        if (clientDisconnected || res.destroyed) break;
         if (stream) {
           const send = { ...injectPrefs(body, modelId, attempt), model: attempt.sendModel };
           const acc = pickAccount();
@@ -839,6 +857,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
               try { reader?.releaseLock(); } catch {}
             }
           }
+          if (clientDisconnected || res.destroyed) break;
           const ms = Date.now() - t1;
           if (up && !isSSE) {
             let text = '';
@@ -848,7 +867,8 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
               const rest = await up.text().catch(() => '');
               text = firstChunk.toString('utf8') + rest;
             } else {
-              text = await up.text();
+              // 上游断网时读 body 会抛（TypeError: terminated）：按网络错误处理，继续切下一个候选
+              text = await up.text().catch(() => '');
             }
             try { json = JSON.parse(text); } catch {}
             const msg = errText(json?.error) || text.slice(0, 160) || netError;
@@ -867,10 +887,11 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
           trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, viaHas: attempt.viaHas, upstream: attempt.upstream, status: 200, ms, note: 'stream' });
-          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
+          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0, cleanupCloseHooks };
         }
         // 非流式
         const r = await attemptOnce(attempt.sendModel, modelId, body, attempt, ctrl.signal);
+        if (clientDisconnected || res.destroyed) break;
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
         trace.push({ model: attempt.sendModel, viaPublic: attempt.viaPublic, viaHas: attempt.viaHas, upstream: attempt.upstream, status: r.status, ms, note });
@@ -884,7 +905,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       }
     }
   } finally {
-    if (!keepCloseHook) req.off('close', onClientClose);
+    if (!keepCloseHook) cleanupCloseHooks();
   }
   return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null };
 }
@@ -900,7 +921,13 @@ async function handleChat(req, res) {
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
   const isStream = !!body.stream;
 
-  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+  const chain = await runChatChain(req, res, body, modelId, cfg, { stream: isStream });
+
+  // The caller may disconnect while the upstream connection is being established.
+  if (res.destroyed || req.aborted) {
+    chain.cleanupCloseHooks?.();
+    return;
+  }
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
@@ -945,7 +972,26 @@ async function handleChat(req, res) {
         cb();
       },
     });
-    Readable.fromWeb(up.body).pipe(tap).pipe(res);
+    // 必须用 pipeline 而不是 pipe：上游断网/重启时 undici 会让响应 body 报错（TypeError: terminated），
+    // 而 pipe 不转发 'error'，无人监听的 error 事件会直接终止整个进程。
+    // pipeline 负责在出错时销毁 source/tap/res，并在这里统一收尾。
+    // 客户端可能刚好在发响应头和建立 pipeline 之间断开；此时 pipeline 会同步抛错，
+    // 必须把它纳入单请求错误路径，不能让异常冒泡到进程级 uncaughtException。
+    try {
+      pipeline(Readable.fromWeb(up.body), tap, res, (err) => {
+        chain.cleanupCloseHooks?.();
+        if (!err) return; // 正常结束：tap.flush 已记录
+        console.error(`[流中断] ${modelId}: ${err.message}`);
+        record(modelId, {
+          provider: null, canonical: null, ms: Date.now() - t0, stream: true,
+          error: `stream_interrupted: ${err.message}`,
+          account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace,
+        });
+      });
+    } catch (err) {
+      chain.cleanupCloseHooks?.();
+      if (!res.destroyed) throw err;
+    }
     return;
   }
 
@@ -1055,7 +1101,7 @@ const server = http.createServer(async (req, res) => {
       else if (upstream !== undefined) cfg.upstreams = upstream ? [upstream] : [];
       if (exclude !== undefined) cfg.exclude = exclude;
       const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
-      const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
+      const chain = await runChatChain(req, res, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
       const trace = chain.trace || [];
       if (chain.status !== 200) {
         return sendJSON(res, 200, {
@@ -1176,15 +1222,24 @@ const server = http.createServer(async (req, res) => {
         : [...new Set([...config.knownModels, ...Object.keys(config.perModel)])];
       return sendJSON(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model' })) });
     }
-    if (CHAT_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);
+    if (CHAT_PATHS.has(p) && req.method === 'POST') return await handleChat(req, res);
     return sendJSON(res, 404, { error: { message: `no route: ${req.method} ${p}` } });
   } catch (e) {
-    return sendJSON(res, 500, { error: { message: e.message } });
+    if (res.destroyed || res.writableEnded) return;
+    // 响应头已发出（流式透传中）：不能再写 JSON，只能断开这条连接
+    if (!res.headersSent) return sendJSON(res, 500, { error: { message: e.message } });
+    console.error(`[错误] ${req.method} ${p}: ${e.message}`);
+    try { res.destroy(); } catch {}
   }
 });
 
 // HTTP 响应头只允许 Latin-1，账号名里的中文等字符需要清洗（历史/统计仍用原名）
 const headerSafe = (s) => String(s ?? '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 80) || '-';
+
+// 最后一道兜底：单条请求链路里的意外异常只记录，不让整个代理进程退出。
+// 正常路径都有各自的 try/catch 与 pipeline 收尾，这里只应该承接真正漏网的错误。
+process.on('uncaughtException', (e) => console.error(`[未捕获异常] ${e?.stack || e}`));
+process.on('unhandledRejection', (e) => console.error(`[未处理拒绝] ${e?.stack || e}`));
 
 server.on('error', (e) => {
   console.error(`[错误] 端口 ${config.port} 监听失败（可能被占用）：${e.message}`);
